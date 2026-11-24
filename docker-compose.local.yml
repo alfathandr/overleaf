@@ -1,0 +1,75 @@
+# Ready-to-run local Overleaf CE + AI LaTeX Assistant + MCP Server
+# Usage:
+#   Option A (prebuilt image from GitHub Actions):
+#     docker compose -f docker-compose.local.yml up -d
+#   Option B (build directly from local source):
+#     docker compose -f docker-compose.local.yml up -d --build
+#
+# Access:
+#   - First time admin setup: http://localhost:8080/launchpad
+#   - App & Editor:           http://localhost:8080
+#   - MCP Server endpoint:    http://localhost:8080/mcp
+
+services:
+  overleaf:
+    image: ${OVERLEAF_IMAGE:-ghcr.io/alfathandr/overleaf:latest}
+    build:
+      context: .
+      dockerfile: server-ce/Dockerfile
+      args:
+        OVERLEAF_BASE_TAG: sharelatex/sharelatex-base:latest
+    container_name: overleaf-local
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8080:80"
+    extra_hosts:
+      # Allows Custom AI Provider to reach local Ollama / LM Studio on the host
+      - "host.docker.internal:host-gateway"
+    stop_grace_period: 30s
+    volumes:
+      - overleaf_data:/var/lib/overleaf
+    environment:
+      OVERLEAF_APP_NAME: Overleaf AI Local
+      OVERLEAF_MONGO_URL: mongodb://mongo/sharelatex
+      OVERLEAF_REDIS_HOST: redis
+      REDIS_HOST: redis
+      OVERLEAF_INVITE_TOKEN_SECRET: "${OVERLEAF_INVITE_TOKEN_SECRET:-local-personal-overleaf-secret-change-me}"
+      OVERLEAF_AI_ENCRYPTION_KEY: "${OVERLEAF_AI_ENCRYPTION_KEY:-local-personal-ai-encryption-key-change-me}"
+      ENABLED_LINKED_FILE_TYPES: "project_file,project_output_file"
+      ENABLE_CONVERSIONS: "true"
+      EMAIL_CONFIRMATION_DISABLED: "true"
+
+  mongo:
+    image: mongo:8.0
+    container_name: overleaf-local-mongo
+    restart: unless-stopped
+    command: "--replSet overleaf --wiredTigerCacheSizeGB 0.5"
+    volumes:
+      - overleaf_mongo_data:/data/db
+      - ./bin/shared/mongodb-init-replica-set.js:/docker-entrypoint-initdb.d/mongodb-init-replica-set.js:ro
+    environment:
+      MONGO_INITDB_DATABASE: sharelatex
+    extra_hosts:
+      - "mongo:127.0.0.1"
+    healthcheck:
+      test: echo 'db.stats().ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  redis:
+    image: redis:6.2
+    container_name: overleaf-local-redis
+    restart: unless-stopped
+    volumes:
+      - overleaf_redis_data:/data
+
+volumes:
+  overleaf_data:
+  overleaf_mongo_data:
+  overleaf_redis_data:
