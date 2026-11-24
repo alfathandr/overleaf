@@ -34,6 +34,9 @@ import importOverleafModules from '../../../../../macros/import-overleaf-module.
 import { shouldIncludeElement } from '@/features/ide-react/util/rail-utils'
 import { useEditorContext } from '@/shared/context/editor-context'
 import useEventListener from '@/shared/hooks/use-event-listener'
+import AiAssistantPanel, {
+  AiAssistantIcon,
+} from '../../../../../../modules/ai-assistant/frontend/js/ai-assistant-panel'
 
 const moduleRailEntries = (
   importOverleafModules('railEntries') as {
@@ -106,6 +109,13 @@ export const RailLayout = () => {
         // NOTE: We always need to mount the file tree on first load
         // since it is responsible for opening the initial document.
         mountOnFirstLoad: true,
+      },
+      {
+        key: 'ai-assistant',
+        icon: AiAssistantIcon,
+        title: 'AI Assistant',
+        component: <AiAssistantPanel />,
+        hide: isRestrictedTokenMember,
       },
       {
         key: 'full-project-search',
