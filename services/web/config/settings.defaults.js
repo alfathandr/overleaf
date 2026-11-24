@@ -1082,6 +1082,7 @@ module.exports = {
   },
 
   moduleImportSequence: [
+    'ai-assistant',
     'history-v1',
     'launchpad',
     'server-ce-scripts',
