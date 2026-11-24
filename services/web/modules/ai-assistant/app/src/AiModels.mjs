@@ -8,6 +8,11 @@ const McpTokenSchema = new Schema(
   {
     id: { type: String, required: true },
     name: { type: String, required: true },
+    scope: {
+      type: String,
+      enum: ['read', 'write'],
+      default: 'write',
+    },
     tokenHash: { type: String, required: true },
     tokenPrefix: { type: String, required: true },
     createdAt: { type: Date, default: Date.now },
@@ -42,6 +47,30 @@ export const AiUserConfigSchema = new Schema(
 
 AiUserConfigSchema.index({ 'mcpTokens.tokenHash': 1 })
 
+export const AiChatMessageSchema = new Schema(
+  {
+    id: { type: String, required: true },
+    role: { type: String, enum: ['user', 'assistant'], required: true },
+    content: { type: String, default: '' },
+    proposedEdits: { type: [Schema.Types.Mixed], default: [] },
+    toolTrace: { type: [Schema.Types.Mixed], default: [] },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { _id: false }
+)
+
+export const AiChatSessionSchema = new Schema(
+  {
+    userId: { type: String, required: true, index: true },
+    projectId: { type: String, required: true, index: true },
+    title: { type: String, default: 'New Chat' },
+    messages: { type: [AiChatMessageSchema], default: [] },
+  },
+  { timestamps: true, minimize: false }
+)
+
+AiChatSessionSchema.index({ userId: 1, projectId: 1, updatedAt: -1 })
+
 export const AiSkillSchema = new Schema(
   {
     userId: { type: String, required: true, index: true },
@@ -65,6 +94,10 @@ AiSkillSchema.index({ userId: 1, slug: 1 }, { unique: true })
 export const AiUserConfig =
   mongoose.models.AiUserConfig ||
   mongoose.model('AiUserConfig', AiUserConfigSchema)
+
+export const AiChatSession =
+  mongoose.models.AiChatSession ||
+  mongoose.model('AiChatSession', AiChatSessionSchema)
 
 export const AiSkill =
   mongoose.models.AiSkill || mongoose.model('AiSkill', AiSkillSchema)

@@ -12,6 +12,7 @@ import {
   deleteEntity,
   compileAndPreview,
 } from './ProjectWorkspaceService.mjs'
+import { lookupBibtex } from './BibtexLookupService.mjs'
 
 const MCP_SERVER_INFO = {
   name: 'overleaf-ai-mcp',
@@ -142,7 +143,25 @@ const MCP_TOOLS = [
       required: ['projectId'],
     },
   },
+  {
+    name: 'lookup_bibtex',
+    description:
+      'Fetch official BibTeX citation metadata from a DOI (e.g. "10.1145/3292500.3330701") or arXiv ID (e.g. "2303.08774").',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        doi: { type: 'string', description: 'DOI identifier or doi.org URL' },
+        arxivId: {
+          type: 'string',
+          description: 'arXiv ID (e.g. "2303.08774") or arxiv.org URL',
+        },
+      },
+      required: [],
+    },
+  },
 ]
+
+const WRITE_TOOLS = new Set(['write_document', 'patch_document', 'delete_file'])
 
 async function authenticateBearer(req) {
   const authHeader = req.get('Authorization') || ''
@@ -157,12 +176,17 @@ async function authenticateBearer(req) {
   })
   if (!config) return null
 
+  const tokenEntry = (config.mcpTokens || []).find(
+    t => t.tokenHash === tokenHash
+  )
+  const scope = tokenEntry?.scope === 'read' ? 'read' : 'write'
+
   await AiUserConfig.updateOne(
     { _id: config._id, 'mcpTokens.tokenHash': tokenHash },
     { $set: { 'mcpTokens.$.lastUsedAt': new Date() } }
   ).catch(() => {})
 
-  return String(config.userId)
+  return { userId: String(config.userId), scope }
 }
 
 async function assertReadAccess(userId, projectId) {
@@ -176,10 +200,15 @@ async function assertReadAccess(userId, projectId) {
   }
 }
 
-async function assertWriteAccess(userId, projectId) {
+async function assertWriteAccess(auth, projectId) {
+  if (auth.scope !== 'write') {
+    throw new Error(
+      'Forbidden: this MCP token is Read-Only. Generate a Read & Write token to edit Overleaf files.'
+    )
+  }
   const allowed =
     await AuthorizationManager.promises.canUserWriteProjectContent(
-      userId,
+      auth.userId,
       projectId,
       null
     )
@@ -188,7 +217,8 @@ async function assertWriteAccess(userId, projectId) {
   }
 }
 
-async function callMcpTool(userId, name, args = {}) {
+async function callMcpTool(auth, name, args = {}) {
+  const { userId } = auth
   switch (name) {
     case 'list_projects': {
       const projects = await listUserProjects(userId)
@@ -237,7 +267,7 @@ async function callMcpTool(userId, name, args = {}) {
     }
 
     case 'write_document': {
-      await assertWriteAccess(userId, args.projectId)
+      await assertWriteAccess(auth, args.projectId)
       const res = await writeDocument(
         args.projectId,
         args.path,
@@ -255,7 +285,7 @@ async function callMcpTool(userId, name, args = {}) {
     }
 
     case 'patch_document': {
-      await assertWriteAccess(userId, args.projectId)
+      await assertWriteAccess(auth, args.projectId)
       const res = await patchDocument(
         args.projectId,
         args.path,
@@ -274,7 +304,7 @@ async function callMcpTool(userId, name, args = {}) {
     }
 
     case 'delete_file': {
-      await assertWriteAccess(userId, args.projectId)
+      await assertWriteAccess(auth, args.projectId)
       const res = await deleteEntity(args.projectId, args.path, userId)
       return {
         content: [
@@ -318,12 +348,28 @@ async function callMcpTool(userId, name, args = {}) {
       return { content }
     }
 
+    case 'lookup_bibtex': {
+      const res = await lookupBibtex({
+        doi: args.doi,
+        arxivId: args.arxivId,
+      })
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `BibTeX from ${res.source} (${res.identifier}):\n\n${res.bibtex}`,
+          },
+        ],
+      }
+    }
+
     default:
       throw new Error(`Unknown MCP tool: ${name}`)
   }
 }
 
-async function handleJsonRpcMessage(userId, msg) {
+async function handleJsonRpcMessage(auth, msg) {
+  const { userId, scope } = auth
   const { id, method, params } = msg || {}
 
   if (!method) {
@@ -360,16 +406,20 @@ async function handleJsonRpcMessage(userId, msg) {
     }
 
     if (method === 'tools/list') {
+      const visibleTools =
+        scope === 'read'
+          ? MCP_TOOLS.filter(t => !WRITE_TOOLS.has(t.name))
+          : MCP_TOOLS
       return {
         jsonrpc: '2.0',
         id,
-        result: { tools: MCP_TOOLS },
+        result: { tools: visibleTools },
       }
     }
 
     if (method === 'tools/call') {
       const toolResult = await callMcpTool(
-        userId,
+        auth,
         params?.name,
         params?.arguments || {}
       )
@@ -457,8 +507,8 @@ async function handleJsonRpcMessage(userId, msg) {
 export default {
   async handlePost(req, res) {
     try {
-      const userId = await authenticateBearer(req)
-      if (!userId) {
+      const auth = await authenticateBearer(req)
+      if (!auth) {
         return res.status(401).json({
           jsonrpc: '2.0',
           id: null,
@@ -473,14 +523,14 @@ export default {
       if (Array.isArray(body)) {
         const responses = []
         for (const item of body) {
-          const r = await handleJsonRpcMessage(userId, item)
+          const r = await handleJsonRpcMessage(auth, item)
           if (r !== null) responses.push(r)
         }
         if (responses.length === 0) return res.status(202).end()
         return res.json(responses)
       }
 
-      const response = await handleJsonRpcMessage(userId, body)
+      const response = await handleJsonRpcMessage(auth, body)
       if (response === null) return res.status(202).end()
       return res.json(response)
     } catch (err) {
@@ -494,8 +544,8 @@ export default {
   },
 
   async handleGet(req, res) {
-    const userId = await authenticateBearer(req)
-    if (!userId) {
+    const auth = await authenticateBearer(req)
+    if (!auth) {
       return res.status(401).json({
         error: 'Unauthorized: provide Authorization: Bearer <token>',
       })
@@ -515,11 +565,20 @@ export default {
       return
     }
 
+    const visibleTools =
+      auth.scope === 'read'
+        ? MCP_TOOLS.filter(t => !WRITE_TOOLS.has(t.name))
+        : MCP_TOOLS
+
     return res.json({
       server: MCP_SERVER_INFO,
       protocolVersion: MCP_PROTOCOL_VERSION,
       transport: 'streamable-http',
-      tools: MCP_TOOLS.map(t => ({ name: t.name, description: t.description })),
+      scope: auth.scope,
+      tools: visibleTools.map(t => ({
+        name: t.name,
+        description: t.description,
+      })),
     })
   },
 }

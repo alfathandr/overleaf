@@ -6,11 +6,14 @@ import {
   AiProviderId,
   AiSkillItem,
   ChatImageInput,
+  ChatSessionSummary,
   McpTokenItem,
+  McpTokenScope,
   PreviewPage,
   ProposedEdit,
   ToolTraceItem,
 } from './api'
+import { MarkdownKatex } from './markdown-katex'
 
 type PanelTab = 'chat' | 'skills' | 'mcp' | 'settings'
 
@@ -49,6 +52,40 @@ function getCurrentOpenDocPath(): string | null {
   }
 }
 
+function captureEditorSelection(): string {
+  try {
+    const ide = (window as unknown as Record<string, any>)._ide
+    const cm =
+      ide?.editorManager?.getCodeMirror?.() ||
+      ide?.editorManager?.$scope?.editor?.sharejs_doc
+    if (cm?.state?.selection?.main) {
+      const { from, to } = cm.state.selection.main
+      if (to > from) {
+        return String(cm.state.doc.sliceString(from, to) || '').trim()
+      }
+    }
+    const sel = window.getSelection?.()?.toString() || ''
+    return sel.trim()
+  } catch {
+    return ''
+  }
+}
+
+function triggerOverleafPdfRecompile() {
+  try {
+    const recompileBtn = document.querySelector<HTMLButtonElement>(
+      '[data-testid="recompile-btn"], .btn-recompile, button[aria-label*="Recompile"]'
+    )
+    if (recompileBtn && !recompileBtn.disabled) {
+      recompileBtn.click()
+      return
+    }
+    window.dispatchEvent(new CustomEvent('ide:compile'))
+  } catch {
+    // non-fatal
+  }
+}
+
 export const AiAssistantIcon: React.FC<{ open: boolean; title: string }> = ({
   title,
 }) => (
@@ -68,6 +105,45 @@ export const AiAssistantIcon: React.FC<{ open: boolean; title: string }> = ({
   </svg>
 )
 
+const ColoredDiff: React.FC<{ diff: string }> = ({ diff }) => {
+  const lines = String(diff || '').split(/\r?\n/)
+  return (
+    <pre
+      style={{
+        margin: 0,
+        padding: '6px 0',
+        maxHeight: '180px',
+        overflow: 'auto',
+        fontSize: '11px',
+        background: '#0f172a',
+        color: '#cbd5e1',
+        lineHeight: 1.45,
+      }}
+    >
+      {lines.map((line, i) => {
+        const isAdd = line.startsWith('+ ')
+        const isDel = line.startsWith('- ')
+        return (
+          <div
+            key={i}
+            style={{
+              padding: '0 8px',
+              background: isAdd
+                ? 'rgba(34, 197, 94, 0.22)'
+                : isDel
+                  ? 'rgba(239, 68, 68, 0.22)'
+                  : 'transparent',
+              color: isAdd ? '#86efac' : isDel ? '#fca5a5' : '#cbd5e1',
+            }}
+          >
+            {line || ' '}
+          </div>
+        )
+      })}
+    </pre>
+  )
+}
+
 export default function AiAssistantPanel() {
   const { projectId } = useProjectContext()
   const [activeTab, setActiveTab] = useState<PanelTab>('chat')
@@ -82,12 +158,20 @@ export default function AiAssistantPanel() {
   const [autoPreview, setAutoPreview] = useState(true)
   const [maxPreviewPages, setMaxPreviewPages] = useState(2)
   const [configStatus, setConfigStatus] = useState<string | null>(null)
+  const [testingConn, setTestingConn] = useState(false)
+
+  // Persistent Chat Sessions state
+  const [sessions, setSessions] = useState<ChatSessionSummary[]>([])
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
 
   // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
+  const [selectedSnippet, setSelectedSnippet] = useState('')
   const [attachedImages, setAttachedImages] = useState<ChatImageInput[]>([])
   const [sending, setSending] = useState(false)
+  const [liveStatus, setLiveStatus] = useState<string | null>(null)
+  const [liveTools, setLiveTools] = useState<string[]>([])
   const [applyingId, setApplyingId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
@@ -104,6 +188,7 @@ export default function AiAssistantPanel() {
   // MCP state
   const [mcpTokens, setMcpTokens] = useState<McpTokenItem[]>([])
   const [newTokenName, setNewTokenName] = useState('Claude Desktop / Cursor')
+  const [newTokenScope, setNewTokenScope] = useState<McpTokenScope>('write')
   const [freshRawToken, setFreshRawToken] = useState<string | null>(null)
   const [mcpStatus, setMcpStatus] = useState<string | null>(null)
 
@@ -112,12 +197,37 @@ export default function AiAssistantPanel() {
     return `${window.location.origin}/mcp`
   }, [])
 
+  const loadSessionMessages = useCallback(
+    async (sid: string) => {
+      if (!projectId) return
+      try {
+        const res = await aiApi.getSession(projectId, sid)
+        setActiveSessionId(res.session.id)
+        setMessages(
+          (res.session.messages || []).map(m => ({
+            id: m.id,
+            role: m.role,
+            content: m.content,
+            proposedEdits: m.proposedEdits,
+            toolTrace: m.toolTrace,
+          }))
+        )
+      } catch {
+        // ignore missing session
+      }
+    },
+    [projectId]
+  )
+
   const loadAll = useCallback(async () => {
     try {
-      const [cfg, sk, tk] = await Promise.all([
+      const [cfg, sk, tk, sessRes] = await Promise.all([
         aiApi.getConfig(),
         aiApi.listSkills(),
         aiApi.listMcpTokens(),
+        projectId
+          ? aiApi.listSessions(projectId)
+          : Promise.resolve({ sessions: [] }),
       ])
       setConfig(cfg)
       setProviderDraft(cfg.provider)
@@ -128,12 +238,16 @@ export default function AiAssistantPanel() {
       setMaxPreviewPages(cfg.maxPreviewPages || 2)
       setSkills(sk.skills || [])
       setMcpTokens(tk.tokens || [])
+      setSessions(sessRes.sessions || [])
+      if (sessRes.sessions && sessRes.sessions.length > 0) {
+        await loadSessionMessages(sessRes.sessions[0].id)
+      }
     } catch (err) {
       setConfigStatus(
         err instanceof Error ? err.message : 'Failed to load AI configuration'
       )
     }
-  }, [])
+  }, [projectId, loadSessionMessages])
 
   useEffect(() => {
     void loadAll()
@@ -141,7 +255,7 @@ export default function AiAssistantPanel() {
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, liveStatus, liveTools])
 
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -165,6 +279,28 @@ export default function AiAssistantPanel() {
     }
   }
 
+  const handleTestConnection = async () => {
+    setTestingConn(true)
+    setConfigStatus('Testing connection...')
+    try {
+      const res = await aiApi.testConnection({
+        provider: providerDraft,
+        model: modelDraft,
+        baseUrl: baseUrlDraft,
+        apiKey: apiKeyDraft || undefined,
+      })
+      setConfigStatus(
+        `Connection OK (${res.provider}: ${res.model}) in ${res.latencyMs}ms.`
+      )
+    } catch (err) {
+      setConfigStatus(
+        `Connection failed: ${err instanceof Error ? err.message : 'Unknown error'}`
+      )
+    } finally {
+      setTestingConn(false)
+    }
+  }
+
   const handleClearKey = async () => {
     try {
       const updated = await aiApi.updateConfig({
@@ -175,6 +311,27 @@ export default function AiAssistantPanel() {
       setConfigStatus(`Cleared ${PROVIDER_LABELS[providerDraft]} API key.`)
     } catch (err) {
       setConfigStatus(err instanceof Error ? err.message : 'Failed to clear key')
+    }
+  }
+
+  const handleNewChat = async () => {
+    if (!projectId) return
+    setActiveSessionId(null)
+    setMessages([])
+    setLiveStatus(null)
+    setLiveTools([])
+  }
+
+  const handleDeleteSession = async () => {
+    if (!projectId || !activeSessionId) return
+    await aiApi.deleteSession(projectId, activeSessionId)
+    const next = sessions.filter(s => s.id !== activeSessionId)
+    setSessions(next)
+    if (next.length > 0) {
+      await loadSessionMessages(next[0].id)
+    } else {
+      setActiveSessionId(null)
+      setMessages([])
     }
   }
 
@@ -220,18 +377,45 @@ export default function AiAssistantPanel() {
     setMessages(prev => [...prev, userMsg])
     if (!promptText) setInput('')
     const imgsToSend = [...attachedImages]
+    const snippetToSend = selectedSnippet
     setAttachedImages([])
+    setSelectedSnippet('')
     setSending(true)
+    setLiveStatus('Connecting to AI...')
+    setLiveTools([])
 
     try {
-      const res = await aiApi.chat(projectId, {
-        message: text,
-        history,
-        activeDocPath: getCurrentOpenDocPath(),
-        images: imgsToSend,
-        autoApply,
-        autoPreview,
-      })
+      const res = await aiApi.chatStream(
+        projectId,
+        {
+          sessionId: activeSessionId,
+          message: text,
+          history,
+          activeDocPath: getCurrentOpenDocPath(),
+          selectedText: snippetToSend || null,
+          images: imgsToSend,
+          autoApply,
+          autoPreview,
+        },
+        evt => {
+          if (evt.type === 'status') {
+            setLiveStatus(evt.message)
+          } else if (evt.type === 'tool_start') {
+            setLiveStatus(`Running tool: ${evt.tool}...`)
+            setLiveTools(prev => [...prev, `${evt.tool} (running)`])
+          } else if (evt.type === 'tool_end') {
+            setLiveTools(prev => {
+              const copy = [...prev]
+              if (copy.length > 0) {
+                copy[copy.length - 1] = `${evt.tool}${
+                  evt.imageCount > 0 ? ` (+${evt.imageCount} img)` : ''
+                } ✓`
+              }
+              return copy
+            })
+          }
+        }
+      )
 
       setMessages(prev => [
         ...prev,
@@ -244,6 +428,16 @@ export default function AiAssistantPanel() {
           toolTrace: res.toolTrace,
         },
       ])
+
+      if (res.sessionId) {
+        setActiveSessionId(res.sessionId)
+        const updatedList = await aiApi.listSessions(projectId)
+        setSessions(updatedList.sessions || [])
+      }
+
+      if (autoApply && (res.proposedEdits || []).some(e => e.applied)) {
+        triggerOverleafPdfRecompile()
+      }
     } catch (err) {
       setMessages(prev => [
         ...prev,
@@ -256,6 +450,8 @@ export default function AiAssistantPanel() {
       ])
     } finally {
       setSending(false)
+      setLiveStatus(null)
+      setLiveTools([])
     }
   }
 
@@ -271,13 +467,51 @@ export default function AiAssistantPanel() {
             : {
                 ...m,
                 proposedEdits: (m.proposedEdits || []).map(pe =>
-                  pe.id === edit.id ? { ...pe, applied: true } : pe
+                  pe.id === edit.id
+                    ? { ...pe, applied: true, reverted: false }
+                    : pe
                 ),
               }
         )
       )
+      triggerOverleafPdfRecompile()
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to apply edit')
+    } finally {
+      setApplyingId(null)
+    }
+  }
+
+  const handleApplyAll = async (msgId: string, edits: ProposedEdit[]) => {
+    if (!projectId) return
+    const pending = edits.filter(e => !e.applied && !e.dismissed)
+    for (const edit of pending) {
+      await handleApplyEdit(msgId, edit)
+    }
+  }
+
+  const handleRevertEdit = async (msgId: string, edit: ProposedEdit) => {
+    if (!projectId) return
+    setApplyingId(edit.id)
+    try {
+      await aiApi.applyEdit(projectId, edit.path, edit.oldContent || '')
+      setMessages(prev =>
+        prev.map(m =>
+          m.id !== msgId
+            ? m
+            : {
+                ...m,
+                proposedEdits: (m.proposedEdits || []).map(pe =>
+                  pe.id === edit.id
+                    ? { ...pe, applied: false, reverted: true }
+                    : pe
+                ),
+              }
+        )
+      )
+      triggerOverleafPdfRecompile()
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to revert edit')
     } finally {
       setApplyingId(null)
     }
@@ -376,11 +610,14 @@ export default function AiAssistantPanel() {
     setMcpStatus('Generating token...')
     try {
       const res = await aiApi.createMcpToken(
-        newTokenName.trim() || 'External AI Client'
+        newTokenName.trim() || 'External AI Client',
+        newTokenScope
       )
       setFreshRawToken(res.token.rawToken || null)
       setMcpTokens(prev => [...prev, res.token])
-      setMcpStatus('Token created. Copy it now—it will not be shown again.')
+      setMcpStatus(
+        `Token created (${res.token.scope === 'read' ? 'Read-Only' : 'Read & Write'}). Copy it now—it will not be shown again.`
+      )
     } catch (err) {
       setMcpStatus(err instanceof Error ? err.message : 'Failed to create token')
     }
@@ -421,8 +658,8 @@ export default function AiAssistantPanel() {
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
-        background: '#fff',
-        color: '#1e293b',
+        background: 'var(--bs-body-bg, #ffffff)',
+        color: 'var(--bs-body-color, #1e293b)',
         fontSize: '13px',
       }}
     >
@@ -430,8 +667,8 @@ export default function AiAssistantPanel() {
       <div
         style={{
           padding: '10px 12px 6px',
-          borderBottom: '1px solid #e2e8f0',
-          background: '#f8fafc',
+          borderBottom: '1px solid var(--bs-border-color, #e2e8f0)',
+          background: 'var(--bs-tertiary-bg, #f8fafc)',
         }}
       >
         <div
@@ -448,8 +685,10 @@ export default function AiAssistantPanel() {
               fontSize: '11px',
               padding: '2px 6px',
               borderRadius: '999px',
-              background: isConfigured ? '#dcfce7' : '#fef3c7',
-              color: isConfigured ? '#166534' : '#92400e',
+              background: isConfigured
+                ? 'rgba(22, 163, 74, 0.15)'
+                : 'rgba(217, 119, 6, 0.15)',
+              color: isConfigured ? '#15803d' : '#b45309',
             }}
           >
             {isConfigured
@@ -477,9 +716,16 @@ export default function AiAssistantPanel() {
                 fontSize: '12px',
                 borderRadius: '6px',
                 border: '1px solid',
-                borderColor: activeTab === id ? '#15803d' : '#cbd5e1',
-                background: activeTab === id ? '#15803d' : '#fff',
-                color: activeTab === id ? '#fff' : '#334155',
+                borderColor:
+                  activeTab === id
+                    ? '#15803d'
+                    : 'var(--bs-border-color, #cbd5e1)',
+                background:
+                  activeTab === id ? '#15803d' : 'var(--bs-body-bg, #ffffff)',
+                color:
+                  activeTab === id
+                    ? '#ffffff'
+                    : 'var(--bs-body-color, #334155)',
                 cursor: 'pointer',
                 fontWeight: activeTab === id ? 600 : 400,
               }}
@@ -500,11 +746,59 @@ export default function AiAssistantPanel() {
             minHeight: 0,
           }}
         >
+          {/* Persistent Session Bar */}
+          <div
+            style={{
+              padding: '6px 10px',
+              borderBottom: '1px solid var(--bs-border-color, #e2e8f0)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              background: 'var(--bs-tertiary-bg, #f8fafc)',
+            }}
+          >
+            <select
+              value={activeSessionId || ''}
+              onChange={e => {
+                if (e.target.value) void loadSessionMessages(e.target.value)
+              }}
+              style={{
+                flex: 1,
+                padding: '3px 6px',
+                fontSize: '11px',
+                borderRadius: '5px',
+                border: '1px solid var(--bs-border-color, #cbd5e1)',
+                background: 'var(--bs-body-bg, #fff)',
+                color: 'var(--bs-body-color, #1e293b)',
+              }}
+            >
+              {!activeSessionId && <option value="">New Chat</option>}
+              {sessions.map(s => (
+                <option key={s.id} value={s.id}>
+                  {s.title} ({s.messageCount})
+                </option>
+              ))}
+            </select>
+            <button type="button" onClick={() => void handleNewChat()} style={quickBtnStyle}>
+              + New
+            </button>
+            {activeSessionId && (
+              <button
+                type="button"
+                onClick={() => void handleDeleteSession()}
+                style={{ ...quickBtnStyle, color: '#dc2626' }}
+                title="Delete chat session"
+              >
+                ×
+              </button>
+            )}
+          </div>
+
           {/* Mode toggles + Quick actions */}
           <div
             style={{
               padding: '8px 10px',
-              borderBottom: '1px solid #e2e8f0',
+              borderBottom: '1px solid var(--bs-border-color, #e2e8f0)',
               display: 'flex',
               flexDirection: 'column',
               gap: '6px',
@@ -540,7 +834,7 @@ export default function AiAssistantPanel() {
                 type="button"
                 disabled={sending}
                 onClick={() =>
-                  sendMessage(
+                  void sendMessage(
                     'Compile this project, inspect the rendered PDF preview and LaTeX log, and report any visual or compilation issues.'
                   )
                 }
@@ -552,7 +846,7 @@ export default function AiAssistantPanel() {
                 type="button"
                 disabled={sending}
                 onClick={() =>
-                  sendMessage(
+                  void sendMessage(
                     'Read my main LaTeX files and fix any LaTeX syntax, formatting, or citation issues.'
                   )
                 }
@@ -564,7 +858,7 @@ export default function AiAssistantPanel() {
                 type="button"
                 disabled={sending}
                 onClick={() =>
-                  sendMessage(
+                  void sendMessage(
                     'Review the active document structure and improve the academic writing clarity while preserving all LaTeX commands.'
                   )
                 }
@@ -591,8 +885,8 @@ export default function AiAssistantPanel() {
                 style={{
                   padding: '10px',
                   borderRadius: '6px',
-                  background: '#fffbeb',
-                  border: '1px solid #fcd34d',
+                  background: 'rgba(245, 158, 11, 0.12)',
+                  border: '1px solid rgba(245, 158, 11, 0.45)',
                   fontSize: '12px',
                 }}
               >
@@ -617,205 +911,286 @@ export default function AiAssistantPanel() {
             )}
 
             {messages.length === 0 && (
-              <div style={{ color: '#64748b', fontSize: '12px', lineHeight: 1.5 }}>
+              <div
+                style={{
+                  color: 'var(--bs-secondary-color, #64748b)',
+                  fontSize: '12px',
+                  lineHeight: 1.5,
+                }}
+              >
                 Tanyakan apa saja tentang dokumen LaTeX Anda. AI dapat membaca
-                struktur file proyek, melihat gambar/diagram, membuat & mengedit
-                file LaTeX, serta melakukan compile & preview PDF otomatis.
+                struktur proyek, melihat gambar/diagram, mencari sitasi BibTeX
+                dari DOI/arXiv, membuat &amp; mengedit file, serta melakukan
+                compile &amp; preview PDF otomatis.
               </div>
             )}
 
-            {messages.map(msg => (
-              <div
-                key={msg.id}
-                style={{
-                  alignSelf: msg.role === 'user' ? 'flex-end' : 'stretch',
-                  maxWidth: msg.role === 'user' ? '90%' : '100%',
-                  padding: '8px 10px',
-                  borderRadius: '8px',
-                  background: msg.role === 'user' ? '#ecfdf5' : '#f8fafc',
-                  border:
-                    msg.role === 'user'
-                      ? '1px solid #bbf7d0'
-                      : '1px solid #e2e8f0',
-                }}
-              >
+            {messages.map(msg => {
+              const pendingEdits = (msg.proposedEdits || []).filter(
+                e => !e.applied && !e.dismissed
+              )
+              return (
                 <div
+                  key={msg.id}
                   style={{
-                    fontSize: '11px',
-                    fontWeight: 600,
-                    color: '#475569',
-                    marginBottom: '4px',
+                    alignSelf: msg.role === 'user' ? 'flex-end' : 'stretch',
+                    maxWidth: msg.role === 'user' ? '90%' : '100%',
+                    padding: '8px 10px',
+                    borderRadius: '8px',
+                    background:
+                      msg.role === 'user'
+                        ? 'rgba(22, 163, 74, 0.12)'
+                        : 'var(--bs-tertiary-bg, #f8fafc)',
+                    border:
+                      msg.role === 'user'
+                        ? '1px solid rgba(22, 163, 74, 0.35)'
+                        : '1px solid var(--bs-border-color, #e2e8f0)',
                   }}
                 >
-                  {msg.role === 'user' ? 'You' : 'Overleaf AI'}
-                </div>
-
-                {msg.error && (
-                  <div style={{ color: '#b91c1c', whiteSpace: 'pre-wrap' }}>
-                    Error: {msg.error}
+                  <div
+                    style={{
+                      fontSize: '11px',
+                      fontWeight: 600,
+                      color: 'var(--bs-secondary-color, #475569)',
+                      marginBottom: '4px',
+                    }}
+                  >
+                    {msg.role === 'user' ? 'You' : 'Overleaf AI'}
                   </div>
-                )}
 
-                {msg.content && (
-                  <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>
-                    {msg.content}
-                  </div>
-                )}
-
-                {/* User attached images */}
-                {msg.images && msg.images.length > 0 && (
-                  <div style={{ display: 'flex', gap: '6px', marginTop: '6px', flexWrap: 'wrap' }}>
-                    {msg.images.map((img, i) => (
-                      <img
-                        key={i}
-                        src={`data:${img.mimeType};base64,${img.base64}`}
-                        alt={img.name}
-                        style={{
-                          maxWidth: '100px',
-                          maxHeight: '80px',
-                          borderRadius: '4px',
-                          border: '1px solid #cbd5e1',
-                        }}
-                      />
-                    ))}
-                  </div>
-                )}
-
-                {/* Tool trace */}
-                {msg.toolTrace && msg.toolTrace.length > 0 && (
-                  <details style={{ marginTop: '6px', fontSize: '11px', color: '#475569' }}>
-                    <summary style={{ cursor: 'pointer' }}>
-                      Tools used ({msg.toolTrace.length})
-                    </summary>
-                    <ul style={{ paddingLeft: '16px', margin: '4px 0' }}>
-                      {msg.toolTrace.map((t, idx) => (
-                        <li key={idx}>
-                          <code>{t.tool}</code>
-                          {t.imageCount > 0 ? ` (+${t.imageCount} img)` : ''}
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
-
-                {/* Rendered PDF preview pages */}
-                {msg.previewPages && msg.previewPages.length > 0 && (
-                  <div style={{ marginTop: '8px' }}>
-                    <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '4px' }}>
-                      Compiled PDF Preview Inspected by AI:
+                  {msg.error && (
+                    <div style={{ color: '#dc2626', whiteSpace: 'pre-wrap' }}>
+                      Error: {msg.error}
                     </div>
-                    <div style={{ display: 'flex', gap: '6px', overflowX: 'auto' }}>
-                      {msg.previewPages.map(p => (
+                  )}
+
+                  {msg.content &&
+                    (msg.role === 'assistant' ? (
+                      <MarkdownKatex content={msg.content} />
+                    ) : (
+                      <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>
+                        {msg.content}
+                      </div>
+                    ))}
+
+                  {/* User attached images */}
+                  {msg.images && msg.images.length > 0 && (
+                    <div style={{ display: 'flex', gap: '6px', marginTop: '6px', flexWrap: 'wrap' }}>
+                      {msg.images.map((img, i) => (
                         <img
-                          key={p.page}
-                          src={`data:${p.mimeType};base64,${p.base64}`}
-                          alt={`PDF Page ${p.page}`}
+                          key={i}
+                          src={`data:${img.mimeType};base64,${img.base64}`}
+                          alt={img.name}
                           style={{
-                            maxHeight: '180px',
-                            border: '1px solid #cbd5e1',
+                            maxWidth: '100px',
+                            maxHeight: '80px',
                             borderRadius: '4px',
+                            border: '1px solid var(--bs-border-color, #cbd5e1)',
                           }}
                         />
                       ))}
                     </div>
-                  </div>
-                )}
+                  )}
 
-                {/* Proposed Diff Cards */}
-                {msg.proposedEdits && msg.proposedEdits.length > 0 && (
-                  <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    {msg.proposedEdits.map(edit => (
-                      <div
-                        key={edit.id}
+                  {/* Tool trace */}
+                  {msg.toolTrace && msg.toolTrace.length > 0 && (
+                    <details
+                      style={{
+                        marginTop: '6px',
+                        fontSize: '11px',
+                        color: 'var(--bs-secondary-color, #475569)',
+                      }}
+                    >
+                      <summary style={{ cursor: 'pointer' }}>
+                        Tools used ({msg.toolTrace.length})
+                      </summary>
+                      <ul style={{ paddingLeft: '16px', margin: '4px 0' }}>
+                        {msg.toolTrace.map((t, idx) => (
+                          <li key={idx}>
+                            <code>{t.tool}</code>
+                            {t.imageCount > 0 ? ` (+${t.imageCount} img)` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+
+                  {/* Rendered PDF preview pages */}
+                  {msg.previewPages && msg.previewPages.length > 0 && (
+                    <div style={{ marginTop: '8px' }}>
+                      <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '4px' }}>
+                        Compiled PDF Preview Inspected by AI:
+                      </div>
+                      <div style={{ display: 'flex', gap: '6px', overflowX: 'auto' }}>
+                        {msg.previewPages.map(p => (
+                          <img
+                            key={p.page}
+                            src={`data:${p.mimeType};base64,${p.base64}`}
+                            alt={`PDF Page ${p.page}`}
+                            style={{
+                              maxHeight: '180px',
+                              border: '1px solid var(--bs-border-color, #cbd5e1)',
+                              borderRadius: '4px',
+                            }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Proposed Diff Cards + Apply All + Undo/Revert */}
+                  {msg.proposedEdits && msg.proposedEdits.length > 0 && (
+                    <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      {pendingEdits.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void handleApplyAll(msg.id, msg.proposedEdits || [])
+                          }
+                          style={{ ...primaryBtnStyle, alignSelf: 'flex-end', fontSize: '11px', padding: '4px 10px' }}
+                        >
+                          Apply All ({pendingEdits.length})
+                        </button>
+                      )}
+                      {msg.proposedEdits.map(edit => (
+                        <div
+                          key={edit.id}
+                          style={{
+                            border: '1px solid var(--bs-border-color, #cbd5e1)',
+                            borderRadius: '6px',
+                            background: 'var(--bs-body-bg, #fff)',
+                            overflow: 'hidden',
+                          }}
+                        >
+                          <div
+                            style={{
+                              padding: '6px 8px',
+                              background: 'var(--bs-tertiary-bg, #f1f5f9)',
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center',
+                              gap: '6px',
+                            }}
+                          >
+                            <div>
+                              <code style={{ fontWeight: 600 }}>{edit.path}</code>
+                              <div
+                                style={{
+                                  fontSize: '11px',
+                                  color: 'var(--bs-secondary-color, #475569)',
+                                }}
+                              >
+                                {edit.summary} ({edit.changedLines} lines)
+                              </div>
+                            </div>
+                            {edit.applied ? (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <span style={{ fontSize: '11px', color: '#16a34a', fontWeight: 600 }}>
+                                  Applied ✓
+                                </span>
+                                <button
+                                  type="button"
+                                  disabled={applyingId === edit.id}
+                                  onClick={() => void handleRevertEdit(msg.id, edit)}
+                                  style={{
+                                    padding: '2px 6px',
+                                    fontSize: '11px',
+                                    borderRadius: '4px',
+                                    border: '1px solid var(--bs-border-color, #cbd5e1)',
+                                    background: 'var(--bs-body-bg, #fff)',
+                                    color: 'var(--bs-body-color, #334155)',
+                                    cursor: 'pointer',
+                                  }}
+                                >
+                                  Undo
+                                </button>
+                              </div>
+                            ) : edit.dismissed ? (
+                              <span style={{ fontSize: '11px', color: '#64748b' }}>
+                                Dismissed
+                              </span>
+                            ) : (
+                              <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                                {edit.reverted && (
+                                  <span style={{ fontSize: '10px', color: '#b45309' }}>
+                                    Reverted
+                                  </span>
+                                )}
+                                <button
+                                  type="button"
+                                  disabled={applyingId === edit.id}
+                                  onClick={() => void handleApplyEdit(msg.id, edit)}
+                                  style={{
+                                    padding: '3px 8px',
+                                    fontSize: '11px',
+                                    borderRadius: '4px',
+                                    border: 'none',
+                                    background: '#15803d',
+                                    color: '#fff',
+                                    cursor: 'pointer',
+                                  }}
+                                >
+                                  {applyingId === edit.id ? 'Applying...' : 'Apply'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDismissEdit(msg.id, edit.id)}
+                                  style={{
+                                    padding: '3px 8px',
+                                    fontSize: '11px',
+                                    borderRadius: '4px',
+                                    border: '1px solid var(--bs-border-color, #cbd5e1)',
+                                    background: 'var(--bs-body-bg, #fff)',
+                                    color: 'var(--bs-body-color, #334155)',
+                                    cursor: 'pointer',
+                                  }}
+                                >
+                                  Dismiss
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                          <ColoredDiff diff={edit.diff} />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+
+            {/* Live SSE Progress Panel */}
+            {sending && (
+              <div
+                style={{
+                  padding: '8px 10px',
+                  borderRadius: '6px',
+                  background: 'var(--bs-tertiary-bg, #f1f5f9)',
+                  border: '1px solid var(--bs-border-color, #cbd5e1)',
+                  fontSize: '12px',
+                }}
+              >
+                <div style={{ fontWeight: 600 }}>
+                  {liveStatus || 'AI sedang bekerja...'}
+                </div>
+                {liveTools.length > 0 && (
+                  <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '6px' }}>
+                    {liveTools.map((t, idx) => (
+                      <span
+                        key={idx}
                         style={{
-                          border: '1px solid #cbd5e1',
-                          borderRadius: '6px',
-                          background: '#fff',
-                          overflow: 'hidden',
+                          fontSize: '11px',
+                          padding: '2px 6px',
+                          borderRadius: '999px',
+                          background: 'rgba(22, 163, 74, 0.14)',
+                          color: '#15803d',
                         }}
                       >
-                        <div
-                          style={{
-                            padding: '6px 8px',
-                            background: '#f1f5f9',
-                            display: 'flex',
-                            justifyContent: 'space-between',
-                            alignItems: 'center',
-                            gap: '6px',
-                          }}
-                        >
-                          <div>
-                            <code style={{ fontWeight: 600 }}>{edit.path}</code>
-                            <div style={{ fontSize: '11px', color: '#475569' }}>
-                              {edit.summary} ({edit.changedLines} lines)
-                            </div>
-                          </div>
-                          {edit.applied ? (
-                            <span style={{ fontSize: '11px', color: '#15803d', fontWeight: 600 }}>
-                              Applied ✓
-                            </span>
-                          ) : edit.dismissed ? (
-                            <span style={{ fontSize: '11px', color: '#64748b' }}>
-                              Dismissed
-                            </span>
-                          ) : (
-                            <div style={{ display: 'flex', gap: '4px' }}>
-                              <button
-                                type="button"
-                                disabled={applyingId === edit.id}
-                                onClick={() => handleApplyEdit(msg.id, edit)}
-                                style={{
-                                  padding: '3px 8px',
-                                  fontSize: '11px',
-                                  borderRadius: '4px',
-                                  border: 'none',
-                                  background: '#15803d',
-                                  color: '#fff',
-                                  cursor: 'pointer',
-                                }}
-                              >
-                                {applyingId === edit.id ? 'Applying...' : 'Apply'}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleDismissEdit(msg.id, edit.id)}
-                                style={{
-                                  padding: '3px 8px',
-                                  fontSize: '11px',
-                                  borderRadius: '4px',
-                                  border: '1px solid #cbd5e1',
-                                  background: '#fff',
-                                  cursor: 'pointer',
-                                }}
-                              >
-                                Dismiss
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                        <pre
-                          style={{
-                            margin: 0,
-                            padding: '6px 8px',
-                            maxHeight: '160px',
-                            overflow: 'auto',
-                            fontSize: '11px',
-                            background: '#0f172a',
-                            color: '#e2e8f0',
-                          }}
-                        >
-                          {edit.diff}
-                        </pre>
-                      </div>
+                        {t}
+                      </span>
                     ))}
                   </div>
                 )}
-              </div>
-            ))}
-
-            {sending && (
-              <div style={{ fontSize: '12px', color: '#64748b', fontStyle: 'italic' }}>
-                AI sedang menganalisis proyek & menjalankan tool...
               </div>
             )}
             <div ref={chatEndRef} />
@@ -825,10 +1200,37 @@ export default function AiAssistantPanel() {
           <div
             style={{
               padding: '8px 10px',
-              borderTop: '1px solid #e2e8f0',
-              background: '#f8fafc',
+              borderTop: '1px solid var(--bs-border-color, #e2e8f0)',
+              background: 'var(--bs-tertiary-bg, #f8fafc)',
             }}
           >
+            {selectedSnippet && (
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '4px 8px',
+                  marginBottom: '6px',
+                  borderRadius: '5px',
+                  background: 'rgba(59, 130, 246, 0.12)',
+                  border: '1px solid rgba(59, 130, 246, 0.35)',
+                  fontSize: '11px',
+                }}
+              >
+                <span>
+                  Selection attached ({selectedSnippet.length} chars)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSelectedSnippet('')}
+                  style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'inherit' }}
+                >
+                  ×
+                </button>
+              </div>
+            )}
+
             {attachedImages.length > 0 && (
               <div style={{ display: 'flex', gap: '6px', marginBottom: '6px', flexWrap: 'wrap' }}>
                 {attachedImages.map((img, idx) => (
@@ -839,7 +1241,7 @@ export default function AiAssistantPanel() {
                       alignItems: 'center',
                       gap: '4px',
                       padding: '2px 6px',
-                      background: '#e2e8f0',
+                      background: 'var(--bs-border-color, #e2e8f0)',
                       borderRadius: '4px',
                       fontSize: '11px',
                     }}
@@ -850,7 +1252,7 @@ export default function AiAssistantPanel() {
                       onClick={() =>
                         setAttachedImages(prev => prev.filter((_, i) => i !== idx))
                       }
-                      style={{ border: 'none', background: 'none', cursor: 'pointer', padding: 0 }}
+                      style={{ border: 'none', background: 'none', cursor: 'pointer', padding: 0, color: 'inherit' }}
                     >
                       ×
                     </button>
@@ -874,7 +1276,9 @@ export default function AiAssistantPanel() {
                 resize: 'vertical',
                 padding: '6px 8px',
                 borderRadius: '6px',
-                border: '1px solid #cbd5e1',
+                border: '1px solid var(--bs-border-color, #cbd5e1)',
+                background: 'var(--bs-body-bg, #fff)',
+                color: 'var(--bs-body-color, #1e293b)',
                 fontSize: '12px',
               }}
             />
@@ -884,9 +1288,10 @@ export default function AiAssistantPanel() {
                 justifyContent: 'space-between',
                 alignItems: 'center',
                 marginTop: '6px',
+                gap: '6px',
               }}
             >
-              <div>
+              <div style={{ display: 'flex', gap: '4px' }}>
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -900,7 +1305,21 @@ export default function AiAssistantPanel() {
                   onClick={() => fileInputRef.current?.click()}
                   style={quickBtnStyle}
                 >
-                  + Attach Image
+                  + Image
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const sel = captureEditorSelection()
+                    if (sel) {
+                      setSelectedSnippet(sel)
+                    } else {
+                      alert('Highlight teks di editor LaTeX terlebih dahulu.')
+                    }
+                  }}
+                  style={quickBtnStyle}
+                >
+                  + Selection
                 </button>
               </div>
               <button
@@ -908,12 +1327,7 @@ export default function AiAssistantPanel() {
                 disabled={sending || !input.trim()}
                 onClick={() => void sendMessage()}
                 style={{
-                  padding: '5px 12px',
-                  borderRadius: '6px',
-                  border: 'none',
-                  background: '#15803d',
-                  color: '#fff',
-                  fontWeight: 600,
+                  ...primaryBtnStyle,
                   cursor: sending ? 'wait' : 'pointer',
                 }}
               >
@@ -927,14 +1341,12 @@ export default function AiAssistantPanel() {
       {/* SKILLS TAB */}
       {activeTab === 'skills' && (
         <div style={{ flex: 1, overflowY: 'auto', padding: '10px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          <div style={{ fontSize: '12px', color: '#475569' }}>
-            Install & aktifkan writing skills (format IEEE, gaya akademik, proofreading, dsb.) yang otomatis disuntikkan ke AI saat membantu penulisan.
+          <div style={{ fontSize: '12px', color: 'var(--bs-secondary-color, #475569)' }}>
+            Install &amp; aktifkan writing skills (format IEEE, gaya akademik, proofreading, dsb.) yang otomatis disuntikkan ke AI saat membantu penulisan.
           </div>
 
           {skillStatus && (
-            <div style={{ fontSize: '12px', padding: '6px 8px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px' }}>
-              {skillStatus}
-            </div>
+            <div style={statusBannerStyle}>{skillStatus}</div>
           )}
 
           {/* Installed skills list */}
@@ -944,9 +1356,11 @@ export default function AiAssistantPanel() {
                 key={skill.id}
                 style={{
                   padding: '8px',
-                  border: '1px solid #e2e8f0',
+                  border: '1px solid var(--bs-border-color, #e2e8f0)',
                   borderRadius: '6px',
-                  background: skill.enabled ? '#f8fafc' : '#fff',
+                  background: skill.enabled
+                    ? 'var(--bs-tertiary-bg, #f8fafc)'
+                    : 'var(--bs-body-bg, #fff)',
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -967,7 +1381,7 @@ export default function AiAssistantPanel() {
                   </button>
                 </div>
                 {skill.description && (
-                  <div style={{ fontSize: '11px', color: '#64748b', marginTop: '4px' }}>
+                  <div style={{ fontSize: '11px', color: 'var(--bs-secondary-color, #64748b)', marginTop: '4px' }}>
                     {skill.description}
                   </div>
                 )}
@@ -976,8 +1390,8 @@ export default function AiAssistantPanel() {
           </div>
 
           {/* Upload SKILL.md or import from URL */}
-          <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            <strong style={{ fontSize: '12px' }}>Install Skill from File or URL</strong>
+          <div style={{ borderTop: '1px solid var(--bs-border-color, #e2e8f0)', paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            <strong style={{ fontSize: '12px' }}>Install Skill from File or URL (SSRF-Protected)</strong>
             <div>
               <input
                 ref={skillFileRef}
@@ -1011,7 +1425,7 @@ export default function AiAssistantPanel() {
           {/* Manual skill form */}
           <form
             onSubmit={handleCreateSkill}
-            style={{ borderTop: '1px solid #e2e8f0', paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}
+            style={{ borderTop: '1px solid var(--bs-border-color, #e2e8f0)', paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}
           >
             <strong style={{ fontSize: '12px' }}>Create Custom Writing Skill</strong>
             <input
@@ -1047,25 +1461,21 @@ export default function AiAssistantPanel() {
       {/* MCP TAB */}
       {activeTab === 'mcp' && (
         <div style={{ flex: 1, overflowY: 'auto', padding: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-          <div style={{ fontSize: '12px', color: '#475569', lineHeight: 1.5 }}>
-            Hubungkan AI Chat eksternal (Claude Desktop, Cursor, Windsurf, dll.) ke Overleaf melalui Streamable HTTP MCP Server dengan akses <strong>Read &amp; Write</strong>.
+          <div style={{ fontSize: '12px', color: 'var(--bs-secondary-color, #475569)', lineHeight: 1.5 }}>
+            Hubungkan AI Chat eksternal (Claude Desktop, Cursor, Windsurf, dll.) ke Overleaf melalui Streamable HTTP MCP Server dengan pilihan izin <strong>Read &amp; Write</strong> atau <strong>Read-Only</strong>.
           </div>
 
           <div>
             <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '2px' }}>MCP Endpoint URL</div>
-            <code style={{ display: 'block', padding: '6px 8px', background: '#f1f5f9', borderRadius: '6px', wordBreak: 'break-all' }}>
+            <code style={{ display: 'block', padding: '6px 8px', background: 'var(--bs-tertiary-bg, #f1f5f9)', borderRadius: '6px', wordBreak: 'break-all' }}>
               {mcpEndpointUrl}
             </code>
           </div>
 
-          {mcpStatus && (
-            <div style={{ fontSize: '12px', padding: '6px 8px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px' }}>
-              {mcpStatus}
-            </div>
-          )}
+          {mcpStatus && <div style={statusBannerStyle}>{mcpStatus}</div>}
 
           {freshRawToken && (
-            <div style={{ padding: '8px', background: '#fefce8', border: '1px solid #fde047', borderRadius: '6px' }}>
+            <div style={{ padding: '8px', background: 'rgba(234, 179, 8, 0.14)', border: '1px solid rgba(234, 179, 8, 0.5)', borderRadius: '6px' }}>
               <div style={{ fontSize: '11px', fontWeight: 600 }}>New Bearer Token (copy now):</div>
               <code style={{ display: 'block', wordBreak: 'break-all', fontSize: '11px', marginTop: '4px' }}>
                 {freshRawToken}
@@ -1073,16 +1483,26 @@ export default function AiAssistantPanel() {
             </div>
           )}
 
-          <div style={{ display: 'flex', gap: '4px' }}>
-            <input
-              type="text"
-              value={newTokenName}
-              onChange={e => setNewTokenName(e.target.value)}
-              placeholder="Token label"
-              style={inputStyle}
-            />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            <div style={{ display: 'flex', gap: '4px' }}>
+              <input
+                type="text"
+                value={newTokenName}
+                onChange={e => setNewTokenName(e.target.value)}
+                placeholder="Token label"
+                style={inputStyle}
+              />
+              <select
+                value={newTokenScope}
+                onChange={e => setNewTokenScope(e.target.value as McpTokenScope)}
+                style={{ ...inputStyle, width: 'auto' }}
+              >
+                <option value="write">Read &amp; Write</option>
+                <option value="read">Read-Only</option>
+              </select>
+            </div>
             <button type="button" onClick={() => void handleCreateMcpToken()} style={primaryBtnStyle}>
-              Generate Token
+              Generate MCP Token
             </button>
           </div>
 
@@ -1097,14 +1517,32 @@ export default function AiAssistantPanel() {
                   justifyContent: 'space-between',
                   alignItems: 'center',
                   padding: '6px 8px',
-                  border: '1px solid #e2e8f0',
+                  border: '1px solid var(--bs-border-color, #e2e8f0)',
                   borderRadius: '6px',
                   fontSize: '12px',
                 }}
               >
                 <div>
-                  <div style={{ fontWeight: 600 }}>{t.name}</div>
-                  <code style={{ fontSize: '11px', color: '#64748b' }}>{t.tokenPrefix}</code>
+                  <div style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <span>{t.name}</span>
+                    <span
+                      style={{
+                        fontSize: '10px',
+                        padding: '1px 5px',
+                        borderRadius: '999px',
+                        background:
+                          t.scope === 'read'
+                            ? 'rgba(59, 130, 246, 0.15)'
+                            : 'rgba(22, 163, 74, 0.15)',
+                        color: t.scope === 'read' ? '#2563eb' : '#15803d',
+                      }}
+                    >
+                      {t.scope === 'read' ? 'Read-Only' : 'Read & Write'}
+                    </span>
+                  </div>
+                  <code style={{ fontSize: '11px', color: 'var(--bs-secondary-color, #64748b)' }}>
+                    {t.tokenPrefix}
+                  </code>
                 </div>
                 <button
                   type="button"
@@ -1137,12 +1575,12 @@ export default function AiAssistantPanel() {
             </pre>
           </div>
 
-          <div style={{ fontSize: '11px', color: '#475569' }}>
+          <div style={{ fontSize: '11px', color: 'var(--bs-secondary-color, #475569)' }}>
             <strong>Exposed Tools:</strong> <code>list_projects</code>,{' '}
             <code>get_project_structure</code>, <code>read_document</code>,{' '}
             <code>read_project_image</code>, <code>write_document</code>,{' '}
             <code>patch_document</code>, <code>delete_file</code>,{' '}
-            <code>compile_and_preview</code>.
+            <code>compile_and_preview</code>, <code>lookup_bibtex</code>.
           </div>
         </div>
       )}
@@ -1160,11 +1598,7 @@ export default function AiAssistantPanel() {
             gap: '10px',
           }}
         >
-          {configStatus && (
-            <div style={{ fontSize: '12px', padding: '6px 8px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '6px' }}>
-              {configStatus}
-            </div>
-          )}
+          {configStatus && <div style={statusBannerStyle}>{configStatus}</div>}
 
           <label style={labelStyle}>
             AI Provider
@@ -1210,7 +1644,7 @@ export default function AiAssistantPanel() {
           <label style={labelStyle}>
             API Key ({PROVIDER_LABELS[providerDraft]})
             {config?.apiKeys?.[providerDraft]?.configured && (
-              <span style={{ fontSize: '11px', color: '#15803d', fontWeight: 400 }}>
+              <span style={{ fontSize: '11px', color: '#16a34a', fontWeight: 400 }}>
                 {' '}
                 — Saved ({config.apiKeys[providerDraft].masked})
               </span>
@@ -1268,9 +1702,19 @@ export default function AiAssistantPanel() {
             Default to Auto-Preview compiled PDF with Vision
           </label>
 
-          <button type="submit" style={primaryBtnStyle}>
-            Save Encrypted Settings
-          </button>
+          <div style={{ display: 'flex', gap: '6px' }}>
+            <button type="submit" style={{ ...primaryBtnStyle, flex: 1 }}>
+              Save Encrypted Settings
+            </button>
+            <button
+              type="button"
+              disabled={testingConn || !modelDraft.trim()}
+              onClick={() => void handleTestConnection()}
+              style={quickBtnStyle}
+            >
+              {testingConn ? 'Testing...' : 'Test Connection'}
+            </button>
+          </div>
         </form>
       )}
     </div>
@@ -1281,7 +1725,9 @@ const inputStyle: React.CSSProperties = {
   width: '100%',
   padding: '6px 8px',
   borderRadius: '6px',
-  border: '1px solid #cbd5e1',
+  border: '1px solid var(--bs-border-color, #cbd5e1)',
+  background: 'var(--bs-body-bg, #ffffff)',
+  color: 'var(--bs-body-color, #1e293b)',
   fontSize: '12px',
   marginTop: '4px',
 }
@@ -1297,9 +1743,9 @@ const quickBtnStyle: React.CSSProperties = {
   padding: '4px 8px',
   fontSize: '11px',
   borderRadius: '5px',
-  border: '1px solid #cbd5e1',
-  background: '#fff',
-  color: '#334155',
+  border: '1px solid var(--bs-border-color, #cbd5e1)',
+  background: 'var(--bs-body-bg, #ffffff)',
+  color: 'var(--bs-body-color, #334155)',
   cursor: 'pointer',
 }
 
@@ -1308,8 +1754,16 @@ const primaryBtnStyle: React.CSSProperties = {
   borderRadius: '6px',
   border: 'none',
   background: '#15803d',
-  color: '#fff',
+  color: '#ffffff',
   fontWeight: 600,
   fontSize: '12px',
   cursor: 'pointer',
+}
+
+const statusBannerStyle: React.CSSProperties = {
+  fontSize: '12px',
+  padding: '6px 8px',
+  background: 'rgba(22, 163, 74, 0.12)',
+  border: '1px solid rgba(22, 163, 74, 0.35)',
+  borderRadius: '6px',
 }

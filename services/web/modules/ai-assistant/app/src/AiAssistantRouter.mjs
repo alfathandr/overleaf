@@ -23,6 +23,12 @@ export const AiAssistantRouter = {
       largeJsonParser,
       AiAssistantController.updateConfig
     )
+    webRouter.post(
+      '/api/ai/test-connection',
+      AuthenticationController.requireLogin(),
+      largeJsonParser,
+      AiAssistantController.testConnection
+    )
 
     // Installable writing skills
     webRouter.get(
@@ -72,13 +78,47 @@ export const AiAssistantRouter = {
       AiAssistantController.revokeMcpToken
     )
 
-    // Project-scoped AI chat, diff apply, and visual compile preview
+    // Persistent chat sessions per project
+    webRouter.get(
+      '/api/ai/project/:Project_id/sessions',
+      AuthenticationController.requireLogin(),
+      AuthorizationMiddleware.ensureUserCanReadProject,
+      AiAssistantController.listSessions
+    )
+    webRouter.post(
+      '/api/ai/project/:Project_id/sessions',
+      AuthenticationController.requireLogin(),
+      AuthorizationMiddleware.ensureUserCanWriteProjectContent,
+      largeJsonParser,
+      AiAssistantController.createSession
+    )
+    webRouter.get(
+      '/api/ai/project/:Project_id/sessions/:sessionId',
+      AuthenticationController.requireLogin(),
+      AuthorizationMiddleware.ensureUserCanReadProject,
+      AiAssistantController.getSession
+    )
+    webRouter.delete(
+      '/api/ai/project/:Project_id/sessions/:sessionId',
+      AuthenticationController.requireLogin(),
+      AuthorizationMiddleware.ensureUserCanWriteProjectContent,
+      AiAssistantController.deleteSession
+    )
+
+    // Project-scoped AI chat (JSON + SSE stream), diff apply, and visual preview
     webRouter.post(
       '/api/ai/project/:Project_id/chat',
       AuthenticationController.requireLogin(),
       AuthorizationMiddleware.ensureUserCanWriteProjectContent,
       largeJsonParser,
       AiAssistantController.chat
+    )
+    webRouter.post(
+      '/api/ai/project/:Project_id/chat/stream',
+      AuthenticationController.requireLogin(),
+      AuthorizationMiddleware.ensureUserCanWriteProjectContent,
+      largeJsonParser,
+      AiAssistantController.chatStream
     )
     webRouter.post(
       '/api/ai/project/:Project_id/apply',

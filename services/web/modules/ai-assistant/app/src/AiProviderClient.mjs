@@ -7,6 +7,7 @@ import {
   compileAndPreview,
   buildSimpleDiff,
 } from './ProjectWorkspaceService.mjs'
+import { lookupBibtex } from './BibtexLookupService.mjs'
 
 const MAX_TOOL_STEPS = 8
 
@@ -117,6 +118,25 @@ const AI_TOOL_DEFINITIONS = [
         maxPages: {
           type: 'number',
           description: 'Maximum number of PDF pages to render as images (1-5)',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'lookup_bibtex',
+    description:
+      'Fetch official BibTeX citation metadata from a DOI (e.g. "10.1145/3292500.3330701") or an arXiv ID (e.g. "2303.08774") so you can add accurate entries to .bib files.',
+    parameters: {
+      type: 'object',
+      properties: {
+        doi: {
+          type: 'string',
+          description: 'DOI identifier or doi.org URL',
+        },
+        arxivId: {
+          type: 'string',
+          description: 'arXiv paper ID (e.g. "2303.08774") or arxiv.org URL',
         },
       },
       required: [],
@@ -326,6 +346,17 @@ async function executeTool(toolName, args, ctx) {
     }
   }
 
+  if (toolName === 'lookup_bibtex') {
+    const res = await lookupBibtex({
+      doi: args.doi,
+      arxivId: args.arxivId,
+    })
+    return {
+      text: `BibTeX from ${res.source} (${res.identifier}):\n\n${res.bibtex}`,
+      images: [],
+    }
+  }
+
   return {
     text: `Unknown tool: ${toolName}`,
     images: [],
@@ -408,21 +439,25 @@ async function callOpenAiCompatible({
     headers.Authorization = `Bearer ${apiKey}`
   }
 
+  const reqBody = {
+    model,
+    messages: openAiMessages,
+  }
+  if (tools && tools.length > 0) {
+    reqBody.tools = tools.map(t => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      },
+    }))
+  }
+
   const res = await fetch(endpoint, {
     method: 'POST',
     headers,
-    body: JSON.stringify({
-      model,
-      messages: openAiMessages,
-      tools: tools.map(t => ({
-        type: 'function',
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters,
-        },
-      })),
-    }),
+    body: JSON.stringify(reqBody),
   })
 
   if (!res.ok) {
@@ -513,6 +548,20 @@ async function callAnthropic({ apiKey, model, systemPrompt, messages, tools }) {
     }
   }
 
+  const reqBody = {
+    model,
+    max_tokens: 4096,
+    system: systemPrompt,
+    messages: anthropicMessages,
+  }
+  if (tools && tools.length > 0) {
+    reqBody.tools = tools.map(t => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.parameters,
+    }))
+  }
+
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -520,17 +569,7 @@ async function callAnthropic({ apiKey, model, systemPrompt, messages, tools }) {
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
     },
-    body: JSON.stringify({
-      model,
-      max_tokens: 4096,
-      system: systemPrompt,
-      messages: anthropicMessages,
-      tools: tools.map(t => ({
-        name: t.name,
-        description: t.description,
-        input_schema: t.parameters,
-      })),
-    }),
+    body: JSON.stringify(reqBody),
   })
 
   if (!res.ok) {
@@ -612,22 +651,26 @@ async function callGemini({ apiKey, model, systemPrompt, messages, tools }) {
     }
   }
 
+  const reqBody = {
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents,
+  }
+  if (tools && tools.length > 0) {
+    reqBody.tools = [
+      {
+        functionDeclarations: tools.map(t => ({
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters,
+        })),
+      },
+    ]
+  }
+
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      contents,
-      tools: [
-        {
-          functionDeclarations: tools.map(t => ({
-            name: t.name,
-            description: t.description,
-            parameters: t.parameters,
-          })),
-        },
-      ],
-    }),
+    body: JSON.stringify(reqBody),
   })
 
   if (!res.ok) {
@@ -700,6 +743,25 @@ async function callProvider(providerConfig, payload) {
 }
 
 /**
+ * Tests connectivity and credentials against the configured AI provider & model.
+ */
+export async function testProviderConnection(providerConfig) {
+  const startedAt = Date.now()
+  const turn = await callProvider(providerConfig, {
+    systemPrompt: 'Respond with OK.',
+    messages: [{ role: 'user', content: 'Reply with a single word: OK' }],
+    tools: [],
+  })
+  return {
+    ok: true,
+    latencyMs: Date.now() - startedAt,
+    provider: providerConfig.provider,
+    model: providerConfig.model,
+    reply: (turn.text || 'OK').slice(0, 120),
+  }
+}
+
+/**
  * Runs an agentic Overleaf AI chat turn with project context, skills, vision, and tools.
  */
 export async function runAiChatTurn({
@@ -707,6 +769,7 @@ export async function runAiChatTurn({
   projectId,
   userId,
   activeDocPath,
+  selectedText,
   history,
   userMessage,
   userImages,
@@ -714,7 +777,19 @@ export async function runAiChatTurn({
   autoApply,
   autoPreview,
   maxPreviewPages,
+  onProgress,
 }) {
+  const emit = evt => {
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress(evt)
+      } catch {
+        // ignore progress callback errors
+      }
+    }
+  }
+
+  emit({ type: 'status', message: 'Loading project structure & context...' })
   const structure = await getProjectStructure(projectId)
   const systemPrompt = buildSystemPrompt({
     structure,
@@ -734,9 +809,16 @@ export async function runAiChatTurn({
     }
   }
 
+  let composedUserMessage = String(userMessage || '')
+  if (selectedText && String(selectedText).trim()) {
+    composedUserMessage = `[Currently selected text in ${activeDocPath || 'editor'}]:\n\`\`\`latex\n${String(
+      selectedText
+    ).slice(0, 8000)}\n\`\`\`\n\n${composedUserMessage}`
+  }
+
   messages.push({
     role: 'user',
-    content: String(userMessage || ''),
+    content: composedUserMessage,
     images: (userImages || []).map(img => ({
       mimeType: img.mimeType || 'image/png',
       base64: img.base64,
@@ -752,6 +834,14 @@ export async function runAiChatTurn({
   let finalReply = ''
 
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
+    emit({
+      type: 'status',
+      message:
+        step === 0
+          ? `Thinking with ${providerConfig.provider} (${providerConfig.model})...`
+          : `Analyzing tool results (step ${step + 1})...`,
+    })
+
     const turn = await callProvider(providerConfig, {
       systemPrompt,
       messages,
@@ -770,6 +860,15 @@ export async function runAiChatTurn({
     })
 
     for (const tc of turn.toolCalls) {
+      emit({
+        type: 'tool_start',
+        tool: tc.name,
+        args: tc.arguments || {},
+      })
+
+      const prevEditCount = state.proposedEdits.length
+      const prevPreviewCount = state.previewPages.length
+
       let toolResult
       try {
         toolResult = await executeTool(tc.name, tc.arguments || {}, {
@@ -786,12 +885,21 @@ export async function runAiChatTurn({
         }
       }
 
-      state.toolTrace.push({
+      for (let i = prevEditCount; i < state.proposedEdits.length; i++) {
+        emit({ type: 'proposed_edit', edit: state.proposedEdits[i] })
+      }
+      for (let i = prevPreviewCount; i < state.previewPages.length; i++) {
+        emit({ type: 'preview_page', page: state.previewPages[i] })
+      }
+
+      const traceItem = {
         tool: tc.name,
         args: tc.arguments || {},
         preview: toolResult.text.slice(0, 240),
         imageCount: toolResult.images.length,
-      })
+      }
+      state.toolTrace.push(traceItem)
+      emit({ type: 'tool_end', ...traceItem })
 
       messages.push({
         role: 'tool',
